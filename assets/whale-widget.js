@@ -308,8 +308,26 @@ function dshwvSound(url) {
 
 // 自动播放策略：AudioContext 初始是 suspended，要有一次用户手势才能出声；任务结束音不是手势触发的，
 // 所以挂一次性解锁（首次点击/按键后移除）。
+// v789（issue #179）：**输入法组字期间一律不做事**。用户实测"装了插件后微软拼音打字会自动上屏、
+//   光标跳到最前端"（0.3.16/0.3.17 均复现，卸载即恢复）。我们能做的、也是最有把握的一条，是
+//   让挂件在 composition 期间**完全不碰 DOM、不做重活**：往 document.body 挂节点会触发布局，
+//   而首次按键同步创建/预热 AudioContext 也会让组字被打断。所以：
+//   ① 记录 composition 状态，组字中的 keydown 不解锁音频；
+//   ② 组字期间所有 body 增删一律排队，等 compositionend 之后再补（见 dshwBodyAppend）。
+var dshwvComposing = false
+var dshwvDeferredBody = []
+function dshwvComposingNow() { return dshwvComposing === true }
 try {
-  var dshwvAudioUnlock = function () {
+  document.addEventListener('compositionstart', function () { dshwvComposing = true }, true)
+  document.addEventListener('compositionend', function () {
+    dshwvComposing = false
+    setTimeout(function () { try { dshwvFlushDeferredBody() } catch (err) {} }, 0)
+  }, true)
+} catch (err) {}
+try {
+  var dshwvAudioUnlock = function (ev) {
+    // v789（issue #179）：组字中的按键不做音频解锁（isComposing / keyCode 229 = IME 处理中）
+    try { if (dshwvComposing || (ev && (ev.isComposing === true || ev.keyCode === 229))) return } catch (err) {}
     // v753（issue #135）：音效关掉时**不预解锁** —— 否则一次普通点击就会把 context 转成 running，
     // 断言照挂。注意这里**不摘监听**：之后重新打开开关，下一次点击仍能完成解锁。
     if (dshwvSoundOff()) return
@@ -891,9 +909,23 @@ document.head.appendChild(styleEl)
 // 所以这里统一登记：所有挂到 body 的节点都走 dshwBodyAppend()，守护时逐个补挂；
 // 主动移除（目前只有一处）走 dshwBodyDetach()，避免被守护逻辑"复活"。
 var dshwBodyNodes = []
+// v789（issue #179）：输入法组字期间把"往 body 挂节点"的请求排队 —— 改 document.body 的子节点会触发布局，
+//   在 composition 期间做这件事会让浏览器/输入法重置组字（用户实测：打字自动上屏、光标跳到最前端）。
+//   排队到 compositionend 之后再补挂（正常输入时行为完全不变：非组字状态下一律立即挂）。
+function dshwvFlushDeferredBody() {
+  try {
+    if (dshwvComposing || !dshwvDeferredBody.length) return
+    var list = dshwvDeferredBody.slice()
+    dshwvDeferredBody.length = 0
+    for (var i = 0; i < list.length; i++) {
+      try { if (list[i] && list[i].__detach) dshwBodyDetach(list[i].el); else dshwBodyAppend(list[i]) } catch (err) {}
+    }
+  } catch (err) {}
+}
 function dshwBodyAppend(el) {
   try {
     if (!el) return el
+    if (dshwvComposing && dshwvDeferredBody.indexOf(el) < 0) { dshwvDeferredBody.push(el); return el }
     // 注意：这里必须是**原始**的 document.body.appendChild —— 不能走 dshwBodyAppend 自己
     // （v743 批量改写时曾误替换成自我递归，被 try/catch 吞掉后表现为"登记了但从未挂上"）
     document.body.appendChild(el)
@@ -903,6 +935,8 @@ function dshwBodyAppend(el) {
 }
 function dshwBodyDetach(el) {
   try {
+    // v789（issue #179）：组字期间连"移除"也排队（同样是 body 子节点变更，会打断组字）
+    if (dshwvComposing) { dshwvDeferredBody.push({ __detach: true, el: el }); return }
     var i = dshwBodyNodes.indexOf(el)
     if (i >= 0) dshwBodyNodes.splice(i, 1)
     if (el && el.parentNode) el.parentNode.removeChild(el)
@@ -1038,6 +1072,8 @@ if (!window.__dshwCustBound) {
     dshwCustSelClose()
   }, true)
   document.addEventListener('keydown', function (e) {
+    // v789（issue #179）：组字中按 Esc 是输入法的「取消组字」，别抢
+    if (dshwvComposingNow()) return
     if (e.key === 'Escape') dshwCustCloseNow()
   }, true)
   window.addEventListener('resize', function () { dshwCustCloseNow() })
@@ -3576,6 +3612,33 @@ function openApiModelPanel(modelId) {
     var authInp = apiTextInput(bal.auth == null ? 'Bearer {key}' : bal.auth, '请求头模板，{key} 会被替换成密钥')
     var authRow = apiPanelRow('请求头', authInp)
     card.appendChild(authRow)
+    // v789（issue #190）：余额接口不再只能是 GET —— 可选 POST/PUT… + JSON 请求体。
+    //   请求体支持 {key}（密钥）、{base}（Base URL）、{uuid}（下面「请求参数」里的键）
+    var balMethod = apiSelectEl([['GET', 'GET（默认）'], ['POST', 'POST'], ['PUT', 'PUT'], ['PATCH', 'PATCH']],
+      String(bal.method || 'GET').toUpperCase() === 'POST' ? 'POST' : String(bal.method || 'GET').toUpperCase() === 'PUT' ? 'PUT' : String(bal.method || 'GET').toUpperCase() === 'PATCH' ? 'PATCH' : 'GET')
+    var balMethodRow = apiPanelRow('请求方法', balMethod)
+    card.appendChild(balMethodRow)
+    var balBody = apiTextInput(bal.body || '', '如 {"uuid":"{uuid}"}（非 GET 时以 JSON 发送）')
+    var balBodyRow = apiPanelRow('请求体', balBody)
+    card.appendChild(balBodyRow)
+    var prm = (m && m.params) || {}
+    var prmInp = apiTextInput(Object.keys(prm).map(function (k) { return k + '=' + prm[k] }).join(','), '请求体占位符，如 uuid=abc123（逗号分隔）')
+    var prmRow = apiPanelRow('请求参数', prmInp)
+    card.appendChild(prmRow)
+    // v789（issue #189）：0.3.15 起的"凭据目的地白名单"唯一例外必须能在界面上勾 ——
+    //   宿主侧 model.allowCustomHost 一直是齐的，缺的就是这个入口（README/FAQ 都在指引用户来勾）。
+    //   勾选/取消都**显式**传 true/false（宿主按 === true / === false 分支，缺省表示"不改动"）。
+    var allowHost = document.createElement('input')
+    allowHost.type = 'checkbox'
+    allowHost.checked = !!(m && m.balanceDesc && m.balanceDesc.allowCustomHost === true) || !!(m && m.allowCustomHost === true)
+    var allowHostRow = apiPanelRow('允许把凭据发送到自定义地址', allowHost)
+    card.appendChild(allowHostRow)
+    var allowHint = document.createElement('div')
+    allowHint.className = 'dshwv-bubhint'
+    allowHint.style.margin = '0 0 6px'
+    allowHint.textContent = '默认不勾：地址不是该厂商内置端点时，插件会拒绝把密钥发出去。自建网关（New API / 自托管 / Ollama 等）确认是自己的服务后再勾。' +
+      '该开关只能由本机（回环）来源的写请求置位，远端会话改不了它。'
+    card.appendChild(allowHint)
     var jr = (bal.json || {})
     var jRem = apiTextInput(jr.remaining || '', '如 balance_infos[0].total_balance')
     var jTot = apiTextInput(jr.total || '', '如 data.total_credits')
@@ -3648,8 +3711,24 @@ function openApiModelPanel(modelId) {
           balance: {
             url: (balUrl.value || '').trim(),
             auth: (authInp.value || '').trim(),
+            // v789：显式带上方法/请求体（GET + 空体 = 老行为；宿主侧空值不覆盖模板）
+            method: (balMethod.value || 'GET').toUpperCase(),
+            body: (balBody.value || '').trim(),
             json: json,
           },
+          // v789（issue #189）：显式 true/false（不是"仅 true 才传"）—— 用户要能**取消**勾选
+          allowCustomHost: !!allowHost.checked,
+          params: (function () {
+            var o = {}
+            String(prmInp.value || '').split(',').forEach(function (kv) {
+              var i = kv.indexOf('=')
+              if (i <= 0) return
+              var k = kv.slice(0, i).trim()
+              var v = kv.slice(i + 1).trim()
+              if (/^[A-Za-z_][A-Za-z0-9_]{0,30}$/.test(k)) o[k] = v
+            })
+            return o
+          })(),
           matchIds: (matchInp.value || '').split(',').map(function (s) { return s.trim() }).filter(function (s) { return s.length > 0 }),
           price: { hit: (pHit.value || '').trim(), miss: (pMiss.value || '').trim(), out: (pOut.value || '').trim(), cur: pCur.value, rate: (pRate.value || '').trim() },
         },
@@ -6487,7 +6566,7 @@ var bubbleMoreListEl = null
 var bubbleFirstChipEl = null
 var BUBBLE_KIND_LABEL = { normal: '余额内容', random: '随机语句', custom: '自定义内容' }
 // v209 默认泡泡内容 = 与开发者当前线上生效配置一致(全新安装/恢复默认时即此体验)
-// —— 首次点击:标题文本 + 余额数值 + 今日已用 + 峰谷时段
+// —— 首次点击:标题文本 + 总余额 + 今日已用 + 峰谷时段
 function bubbleDefaultFirstModules() {
   // v630:normal/首次 兜底默认 = v615 冻结出厂默认第 1 泡(靛蓝余额卡 5 模块),与「恢复默认」一致;
   // 以下旧体(macaron 版)仅在常量缺失时作兜底参照,不再作为默认内容
@@ -7318,6 +7397,13 @@ var BUBBLE_DEFAULT_ITEMS = [
                                                                                "rgb":  "macaron",
                                                                                "italic":  true,
                                                                                "ul":  false
+                                                                           },
+                                                                           {
+                                                                               "t":  "token 来!",
+                                                                               "w":  3,
+                                                                               "size":  16,
+                                                                               "rgb":  "candy",
+                                                                               "color":  ""
                                                                            }
                                                                        ],
                                                              "size":  8
@@ -7610,7 +7696,10 @@ function bubbleDefaultModules(kind) {
 }
 function bubbleModuleSummary(m) {
   m = m || {}
-  if (m.type === 'balance') return bubbleIsModelMod(m) ? ('余额·' + ((apiModelBalanceInfo(m.modelId) || {}).name || m.modelId)) : '余额数值'
+  if (m.type === 'balance') return bubbleIsModelMod(m) ? ('余额·' + ((apiModelBalanceInfo(m.modelId) || {}).name || m.modelId)) : '总余额(充值金额+赠金)'
+  // v782：赠金 / 充值余额（均为内置数值模块，无 modelId）；v787 按用户要求改显示文案
+  if (m.type === 'bonus') return '赠金'
+  if (m.type === 'recharge') return '充值余额'
   if (m.type === 'today') return bubbleIsModelMod(m) ? ('今日已用·' + ((apiModelBalanceInfo(m.modelId) || {}).name || m.modelId)) : '今日已用'
   if (m.type === 'session') return '对话名' + (Number(m.len) > 0 ? '(保留 ' + Math.round(Number(m.len)) + ' 字)' : '(不截断)')
   if (m.type === 'quota') return '额度·' + ((apiModelById(m.modelId) || {}).name || m.modelId)
@@ -7628,7 +7717,10 @@ function bubbleModuleListLabel(m) {
   if (m.type === 'text') return '文本: ' + (String(m.text || '').slice(0, 24) || '(空)')
   if (m.type === 'link') return '超链接: ' + (String(m.text || '').slice(0, 24) || '打开链接')
   if (m.type === 'random') return m.name || '随机语句' // 只显示模块名,不展示内部句子
-  if (m.type === 'balance') return bubbleIsModelMod(m) ? ('余额·' + ((apiModelBalanceInfo(m.modelId) || {}).name || m.modelId)) : '余额数值'
+  if (m.type === 'balance') return bubbleIsModelMod(m) ? ('余额·' + ((apiModelBalanceInfo(m.modelId) || {}).name || m.modelId)) : '总余额(充值金额+赠金)'
+  // v782：赠金 / 充值余额（v787 改显示文案）
+  if (m.type === 'bonus') return '赠金'
+  if (m.type === 'recharge') return '充值余额'
   if (m.type === 'today') return bubbleIsModelMod(m) ? ('今日已用·' + ((apiModelBalanceInfo(m.modelId) || {}).name || m.modelId)) : '今日已用'
   if (m.type === 'session') return '对话名' + (Number(m.len) > 0 ? '(保留 ' + Math.round(Number(m.len)) + ' 字)' : '(不截断)')
   if (m.type === 'quota') return '额度·' + ((apiModelById(m.modelId) || {}).name || m.modelId)
@@ -8168,7 +8260,31 @@ function bubbleEditorDirty() {
     return bubbleEditorSnap !== JSON.stringify([bubbleEditItems, bubbleLib, bubbleTapAdvChk.checked])
   } catch (err) { return true }
 }
+// v783：打开编辑器前**先从宿主重读一遍配置**。为什么必须重读：泡泡配置只在页面加载时取一次
+//   （loadBubbleCfg），之后一直用内存里的 bubbleCfg 副本；而桌面端 + 网页端（或两个标签页）会**各持一份**，
+//   谁最后点「保存」谁就把自己那份写回去 ⇒ 在 A 里删掉的模块（或模块库条目）会被 B 的过期副本**写回来**，
+//   表现就是"删了很久的自定义模块又冒出来了"。读失败时保持原值（离线/接口异常行为不变）。
+function refreshBubbleCfgFromHost(cb) {
+  var done = function () { try { cb() } catch (err) {} }
+  try {
+    fetch(BUBBLE_URL, { cache: 'no-store' })
+      .then(function (r) { return r.json() })
+      .then(function (d) {
+        if (d && d.ok && d.config) {
+          bubbleCfg = d.config
+          bubbleLib = (d.config.lib && Array.isArray(d.config.lib)) ? JSON.parse(JSON.stringify(d.config.lib)) : []
+          bubbleTapAdvance = d.config.tapAdvance === true // v727
+          try { applyBubbleCfgSeq() } catch (err) {}
+        }
+      })
+      .catch(function () {})
+      .then(done, done)
+  } catch (err) { done() }
+}
 function openBubbleEditor() {
+  refreshBubbleCfgFromHost(function () { openBubbleEditorWithCache() })
+}
+function openBubbleEditorWithCache() {
   try {
     closeRolePanel()
     closeAudioGroupPanel()
@@ -8355,6 +8471,8 @@ function qeditEnsure() {
       qeditClose()
     }, true)
     document.addEventListener('keydown', function (e) {
+      // v789（issue #179）：组字中按 Esc 是输入法的事，别抢
+      if (dshwvComposingNow()) return
       if (e.key === 'Escape') qeditClose()
     })
   }
@@ -8676,8 +8794,8 @@ function openQuickModuleEditor(m, anchorBtn) {
     var isModelBal = bubbleIsModelMod(m) && (m.type === 'balance' || m.type === 'today')
     var isModelQuota = bubbleIsModelMod(m) && m.type === 'quota'
     var isModelPlan = bubbleIsModelMod(m) && m.type === 'plan'
-    inp.placeholder = isModelPlan ? '例: {plan} 额度 · {plan_reset} 刷新时间' : (isModelQuota ? '例: 额度 {quota} · 剩 {quota_left}' : (isModelBal ? '例: {balance} 或 今日 {today}' : (m.type === 'balance' ? '例: {balance_ds}' : (m.type === 'today' ? '例: 今日已用 {expense_ds}' : (m.type === 'session' ? '例: {session} 或 当前对话 {session}' : (bubbleIsPeakCount(m) ? '例: 距空闲 {countdown}' : '例: 当前 {status}'))))))
-    inp.title = '可用占位符(英文): ' + (isModelPlan ? '{plan} 额度 / {plan_left} 剩余 / {plan_reset} 刷新时间（多窗口时随「显示样式」所选窗口变化）' : (isModelQuota ? '{quota} / {quota_used} / {quota_left} / {quota_total} / {quota_reset}' : (isModelBal ? '{balance} / {today}' : (m.type === 'peak' || m.type === 'nextpeak' ? '{status} / {countdown}' : (m.type === 'balance' ? '{balance_ds}' : (m.type === 'today' ? '{expense_ds}' : (m.type === 'session' ? '{session} 当前对话名（按「保留长度」截断）' : '{expense_ds}')))))))
+    inp.placeholder = isModelPlan ? '例: {plan} 额度 · {plan_reset} 刷新时间' : (isModelQuota ? '例: 额度 {quota} · 剩 {quota_left}' : (isModelBal ? '例: {balance} 或 今日 {today}' : (m.type === 'balance' ? '例: {balance_ds}' : (m.type === 'bonus' ? '例: {bonus_ds} 或 赠金 {bonus_ds}' : (m.type === 'recharge' ? '例: {recharge_ds} 或 余额 {recharge_ds}' : (m.type === 'today' ? '例: 今日已用 {expense_ds}' : (m.type === 'session' ? '例: {session} 或 当前对话 {session}' : (bubbleIsPeakCount(m) ? '例: 距空闲 {countdown}' : '例: 当前 {status}'))))))))
+    inp.title = '可用占位符(英文): ' + (isModelPlan ? '{plan} 额度 / {plan_left} 剩余 / {plan_reset} 刷新时间（多窗口时随「显示样式」所选窗口变化）' : (isModelQuota ? '{quota} / {quota_used} / {quota_left} / {quota_total} / {quota_reset}' : (isModelBal ? '{balance} / {today}' : (m.type === 'peak' || m.type === 'nextpeak' ? '{status} / {countdown}' : (m.type === 'balance' ? '{balance_ds}' : (m.type === 'bonus' ? '{bonus_ds}' : (m.type === 'recharge' ? '{recharge_ds}' : (m.type === 'today' ? '{expense_ds}' : (m.type === 'session' ? '{session} 当前对话名（按「保留长度」截断）' : '{expense_ds}')))))))))
     inp.addEventListener('input', function () { m.tpl = inp.value; changed() })
     r.appendChild(inp)
     var qb2 = document.createElement('button')
@@ -8874,7 +8992,12 @@ function renderBubblePal() {
   bubblePalEl.innerHTML = ''
   var defs = [
     { key: 'text', label: '文本', cb: function () { bubbleModuleAdd({ type: 'text', text: '新内容', size: 6, bold: true }) } },
-    { key: 'balance', label: '余额数值', pin: true, cb: function () { bubbleModuleAdd({ type: 'balance', size: 11, tpl: '{balance_ds}' }) } },
+    { key: 'balance', label: '总余额(充值金额+赠金)', pin: true, cb: function () { bubbleModuleAdd({ type: 'balance', size: 11, tpl: '{balance_ds}' }) } },
+    // v782：把「总余额」拆出的两个分量各自做成模块 —— 赠金（未过期赠送余额）与充值余额。
+    //   ⚠️ 上面那条 `balance` / `{balance_ds}` 的**代码名字与行为一律不动**（历史泡泡与已保存的模块里
+    //   存的是 type/tpl 字面量，改代码名会让老内容显示不出来）；v787 只按用户要求改了**显示文案**。
+    { key: 'bonus', label: '赠金', pin: true, cb: function () { bubbleModuleAdd({ type: 'bonus', size: 11, tpl: '{bonus_ds}' }) } },
+    { key: 'recharge', label: '充值余额', pin: true, cb: function () { bubbleModuleAdd({ type: 'recharge', size: 11, tpl: '{recharge_ds}' }) } },
     { key: 'today', label: '今日已用', pin: true, cb: function () { bubbleModuleAdd({ type: 'today', size: 1, tpl: '今日已用 {expense_ds}' }) } },
     { key: 'peak', label: '峰谷时段', pin: true, cb: function () { bubbleModuleAdd({ type: 'peak', size: 4, peakColor: '#e0433f', offColor: '#2fa24c', tpl: '{status}' }) } },
     { key: 'nextpeak', label: '时段倒计时', pin: true, cb: function () { bubbleModuleAdd({ type: 'peak', size: 6, bold: true, peakStyle: 'count', peakColor: '#e0433f', offColor: '#2fa24c', tpl: '{countdown}' }) } },
@@ -9098,7 +9221,8 @@ function bubbleModuleEdit(m, anchorBtn) {
   try {
     if (m && (m.type === 'text' || m.type === 'link')) { openQuickTextEditor(m, anchorBtn); return }
     // v769：对话名也走悬浮编辑（像文本那样边改边看效果），不再开整窗编辑器
-    if (m && (m.type === 'balance' || m.type === 'today' || m.type === 'peak' || m.type === 'nextpeak' || m.type === 'session')) { openQuickModuleEditor(m, anchorBtn); return }
+    // v782：赠金 / 充值余额同样是内置数值模块 ⇒ 也走悬浮编辑（内容锁定，只调字号/颜色/模板）
+    if (m && (m.type === 'balance' || m.type === 'bonus' || m.type === 'recharge' || m.type === 'today' || m.type === 'peak' || m.type === 'nextpeak' || m.type === 'session')) { openQuickModuleEditor(m, anchorBtn); return }
     openModuleEditor(m, function (saved) { if (saved) renderBubblePv() })
   } catch (err) {}
 }
@@ -9197,6 +9321,9 @@ function bubblePvPaletteToRow(key, ri) {
 function bubblePaletteModule(key) {
   if (key === 'text') return { type: 'text', text: '新内容', size: 6, bold: true }
   if (key === 'balance') return { type: 'balance', size: 11, tpl: '{balance_ds}' }
+  // v782：赠金 / 充值余额（拖拽路径；与上面「总余额(充值金额+赠金)」并列的两个内置数值模块）
+  if (key === 'bonus') return { type: 'bonus', size: 11, tpl: '{bonus_ds}' }
+  if (key === 'recharge') return { type: 'recharge', size: 11, tpl: '{recharge_ds}' }
   if (key === 'today') return { type: 'today', size: 1, tpl: '今日已用 {expense_ds}' }
   if (key === 'peak') return { type: 'peak', size: 4, peakColor: '#e0433f', offColor: '#2fa24c', tpl: '{status}' }
   if (key === 'nextpeak') return { type: 'peak', size: 6, bold: true, peakStyle: 'count', peakColor: '#e0433f', offColor: '#2fa24c', tpl: '{countdown}' }
@@ -10278,7 +10405,10 @@ function bubbleFontEditRow(getVal, setVal) {
   return row
 }
 function moduleTypeName(t, m) {
-  if (t === 'balance') return '余额数值'
+  if (t === 'balance') return '总余额(充值金额+赠金)'
+  // v782：赠金 / 充值余额两个数值模块的类型名（v787 改显示文案）
+  if (t === 'bonus') return '赠金'
+  if (t === 'recharge') return '充值余额'
   if (t === 'today') return '今日已用'
   if (t === 'session') return '对话名'
   if (t === 'peak' || t === 'nextpeak') {
@@ -10326,6 +10456,8 @@ function renderModuleEditor() {
     inp.value = m.tpl || ''
     function hintOf() {
       if (m.type === 'balance') return '例: {balance_ds}'
+      if (m.type === 'bonus') return '例: {bonus_ds} 或 赠金 {bonus_ds}'
+      if (m.type === 'recharge') return '例: {recharge_ds} 或 余额 {recharge_ds}'
       if (m.type === 'today') return '例: 今日已用 {expense_ds}'
       if (m.type === 'session') return '例: {session} 或 当前对话 {session}'
       if (bubbleIsPeakCount(m)) return '例: 距空闲 {countdown}'
@@ -11728,6 +11860,42 @@ bubbleBox.addEventListener('click', function (e) {
   bubbleNext()
 })
 
+// ===== v785：桌面客户端「窗口控件带」不进入挂件的可移动范围 =====
+// 背景（用户 2026-10-02 反馈）：客户端右上角的最小化/最大化/关闭会盖在泡泡上方。
+// 查证：DSH 桌面端产品窗口用 Electron `titleBarStyle:'hidden'` + **`titleBarOverlay`**
+//   （主进程写死 height:40；macOS 是 `hiddenInset` + 左上 traffic light）—— 那三个键由**浏览器引擎**
+//   画在所有页面内容之上 ⇒ **CSS/z-index 永远盖不过去**（不是我们层级写低了）。
+// 修法（用户指定）：不做层级对抗、也不平移泡泡，而是**把整条顶带排除在挂件的可移动范围之外**：
+//   挂件顶边（root.top）一律 ≥ 叠层下沿 ⇒ 画在 root 内部的泡泡自然也在带下，
+//   而鲸鱼与泡泡的相对位置**完全不变**（比"泡泡自己下移"更干净）。
+var DESKTOP_TITLEBAR_FALLBACK = 44 // 主进程 titleBarOverlay.height = 40，+4 余量
+function desktopTitlebarBottom() {
+  var wco = null
+  try { wco = navigator.windowControlsOverlay } catch (err) { wco = null }
+  // 没有叠层对象（普通浏览器 / 手机浏览器）或叠层不可见 ⇒ 不需要排除
+  if (!wco || wco.visible === false) return 0
+  // 有叠层：优先用官方矩形；取不到（旧内核/异常）就退回主进程里那个高度，**不能返回 0**
+  try {
+    if (typeof wco.getTitlebarAreaRect === 'function') {
+      var r = wco.getTitlebarAreaRect()
+      if (r && isFinite(r.y) && isFinite(r.height) && r.height > 0) return Math.max(0, Math.round(r.y + r.height))
+    }
+  } catch (err) {}
+  return DESKTOP_TITLEBAR_FALLBACK
+}
+// 挂件顶边的**下限**（0 = 不限制，普通浏览器就是 0）
+function widgetTopMin() {
+  try { return Math.max(0, desktopTitlebarBottom()) } catch (err) { return 0 }
+}
+// 把「挂件顶边」夹进可移动范围：[顶带下沿, 视口内上限]
+function clampWidgetTop(v, maxT) {
+  var min = widgetTopMin()
+  var t = Number(v)
+  if (!isFinite(t)) t = min
+  var hi = Infinity
+  if (maxT !== undefined && isFinite(Number(maxT))) hi = Math.max(min, Number(maxT))
+  return Math.max(min, Math.min(t, hi))
+}
 var body = document.createElement('div')
 body.className = 'dshwv-body'
 body.appendChild(img)
@@ -11828,6 +11996,10 @@ var state = {
   top: 0,
   balance: null,
   currency: null,
+  // v781：余额的两个分量（赠金 / 充值余额）。宿主在 API key 路与 DSH 账号路都会下发；
+  //   取不到时保持 null ⇒ 模块显示 `—`（见 bubbleBonusText/bubbleRechargeText）。
+  bonusBalance: null,
+  rechargeBalance: null,
   todayUsage: null,
   todayUsageCurrency: 'CNY',
   usageLabel: '本地估算',
@@ -12080,6 +12252,32 @@ function restoreBubbleLines() {
 // 消耗=showCostBubble)独立触发, 消耗优先级最高可顶掉当前并暂停手动轮。
 var costBubbleTimer = null // 旧版计时器保留声明(新版 bubbleClearAll 仍清理)
 var bubbleTtlTimer = null
+// v789（issue #188/#172）：泡泡的自动收起**不能只靠 setTimeout** —— 页面被遮挡 / 最小化 / 切到后台时，
+// 浏览器会把定时器节流甚至挂起，于是"5 秒后收起"变成几十秒甚至永远不收（用户实测：点击泡一直不消失、
+// 刷新即恢复）。所以同时记一个**截止时刻**，在页面重新可见 / 拿到焦点时结算一次；再配一个每秒巡检兜底。
+var bubbleTtlDeadline = 0
+function bubbleTtlArmed(ttlMs) {
+  try { if (ttlMs > 0) bubbleTtlDeadline = Date.now() + ttlMs; else bubbleTtlDeadline = 0 } catch (err) { bubbleTtlDeadline = 0 }
+}
+function bubbleTtlClear() { bubbleTtlDeadline = 0 }
+// 巡检：只在"本该已经到期"且计时器已经不在了（被节流/挂起）时补收一次
+function bubbleTtlSweep() {
+  try {
+    if (bubbleTtlTimer || !bubbleTtlDeadline) return
+    if (!bubbleScene || !(bubbleScene.ttlMs > 0)) { bubbleTtlDeadline = 0; return }
+    if (Date.now() < bubbleTtlDeadline) return
+    bubbleTtlDeadline = 0
+    bubbleAutoClose()
+  } catch (err) {}
+}
+// 三条触发路径：页面重新可见（切标签回来）、窗口重新拿到焦点（最小化还原）、以及每秒一次的兜底巡检。
+// 正常前台运行时计时器按时收敛，巡检永远提前返回（不会误收下一个泡泡）。
+try {
+  document.addEventListener('visibilitychange', function () { try { if (!document.hidden) bubbleTtlSweep() } catch (err) {} })
+  window.addEventListener('focus', function () { bubbleTtlSweep() })
+  window.addEventListener('pageshow', function () { bubbleTtlSweep() })
+  setInterval(bubbleTtlSweep, 1000)
+} catch (err) {}
 var bubbleScene = null // { kind:'normal'|'random'|'cost', ttlMs }
 var bubbleSeq = bubbleDefaultQueue() // 默认序列 = 与开发者线上生效一致(首次=余额,再次=随机语句);有配置后由 applyBubbleCfgSeq 覆盖
 var bubbleSeqIdx = 0 // 下一项下标(手动轮内推进)
@@ -12301,6 +12499,8 @@ function bubbleClearAll() {
   try { if (settleTimer) { clearTimeout(settleTimer); settleTimer = null } } catch (err) {}
 }
 function bubbleCloseVisual() {
+  // v789（issue #188）：视觉收起是"泡泡真的收掉了"的唯一出口 ⇒ 顺带把截止时刻清零（三处对齐之二）
+  bubbleTtlClear()
   // v771：泡泡一旦真的收起，等待标记必须一起复位。`waitShown` 平时由 bubbleRenderModules 按场景重算，
   // 但"整泡关闭"（hideBubble/hideCostBubble/hideWaitBubble…）不走渲染 ⇒ 不复位就会残留成 true，
   // 之后 showWaitBubble 会误判"已经在显示等待泡泡"（历史上正是这类不同步把等待泡泡卡死的）。
@@ -12349,7 +12549,8 @@ function sceneOpen(kind, renderFn, ttlMs) {
         }, 180)
       } catch (err) {}
     }
-    if (ttlMs > 0) bubbleTtlTimer = setTimeout(bubbleAutoClose, ttlMs)
+    if (ttlMs > 0) { bubbleTtlArmed(ttlMs); bubbleTtlTimer = setTimeout(bubbleAutoClose, ttlMs) }
+    else bubbleTtlClear()
   }
   if (wasOpen) {
     // 内容切换:旧内容先淡出,再换新内容并淡入(可被新场景/关闭随时打断)
@@ -12369,6 +12570,8 @@ function sceneOpen(kind, renderFn, ttlMs) {
 }
 function bubbleAutoClose() {
   bubbleTtlTimer = null
+  // v789：走完这条就说明本次 TTL 已经结算，截止时刻必须清零，否则巡检会误收下一个泡泡
+  bubbleTtlClear()
   if (bubbleScene && bubbleScene.kind === 'cost') { if (whaleSysSwapNext()) return; hideCostBubble(); return }
   if (bubbleScene && bubbleScene.kind === 'alert') { if (whaleSysSwapNext()) return; hideUsageAlertBubble(); return }
   // v761（#161 C5）：等待交互泡泡是**常驻**的（sceneOpen 收到 ttl 0 不布计时器），正常永远走不到这里；
@@ -12379,7 +12582,9 @@ function bubbleAutoClose() {
 // 重置当前泡泡的留存计时(点鲸鱼给第 1 泡续时,不清内容)
 function bubbleResetTtl() {
   try { if (bubbleTtlTimer) { clearTimeout(bubbleTtlTimer); bubbleTtlTimer = null } } catch (err) {}
-  if (bubbleScene && bubbleScene.ttlMs > 0) bubbleTtlTimer = setTimeout(bubbleAutoClose, bubbleScene.ttlMs)
+  // v789：续时也要同步截止时刻，否则巡检会在"刚续过"的泡泡上提前动作（issue #188 提醒的三处对齐之一）
+  if (bubbleScene && bubbleScene.ttlMs > 0) { bubbleTtlArmed(bubbleScene.ttlMs); bubbleTtlTimer = setTimeout(bubbleAutoClose, bubbleScene.ttlMs) }
+  else bubbleTtlClear()
 }
 // 默认内容视图 = 现在待机内容(余额/今日已用),由 render/restore 维护
 function bubbleRenderDefault() { restoreBubbleLines() }
@@ -12444,8 +12649,11 @@ function bubbleShowSeqNext() {
   }
 }
 // ===== 模块渲染引擎(B1) =====
-// 模块:{type:'text'|'balance'|'today'|'peak'|'session'|'image'|'random', text?, imgId?, color?, size?(1..8 档),
+// 模块:{type:'text'|'balance'|'bonus'|'recharge'|'today'|'peak'|'session'|'image'|'random', text?, imgId?, color?, size?(1..8 档),
 //        lines?:[{t,w}] (random 自带句子列表), tpl?(占位符模板), len?(session 的「保留长度」，0=不截断)}
+//   v782 新增 'bonus'（赠金）与 'recharge'（充值余额）：与 'balance' 并列的内置数值模块，
+//   分别用占位符 {bonus_ds} / {recharge_ds}；**'balance' / '{balance_ds}' 的名字与行为一律不动**
+//   （历史泡泡里存的是这些字面量，改名会让老内容显示不出来）。
 // 字号档位 1..50,线性细分(1→40u … 50→240u,相对 --dshw-u 的倍数)
 function bubbleModuleFontU(level) {
   var n = Number(level) || 6
@@ -12459,6 +12667,19 @@ function bubbleAmountText() {
 }
 function bubbleTodayText() {
   return (state.usageLabel || '今日已用') + ' ' + (state.todayUsage !== null && state.todayUsage !== undefined ? fmt(state.todayUsage, state.todayUsageCurrency || state.currency) : '--')
+}
+// v782：赠金 / 充值余额两个数值模块的取数（与「总余额(充值金额+赠金)」同源：宿主余额返回体）。
+//   ⚠️ 两个数字**可能拿不到**（厂商没有该字段、或未登录账号）⇒ 显示 `—`，**不显示 0**
+//   —— 0 的意思是"确实没有了"，与"读不到"是两件事（记账也依赖这个区分）。
+function bubbleBonusText() {
+  var v = state.bonusBalance
+  if (v === null || v === undefined || !isFinite(Number(v))) return '—'
+  return fmt(Number(v), state.currency)
+}
+function bubbleRechargeText() {
+  var v = state.rechargeBalance
+  if (v === null || v === undefined || !isFinite(Number(v))) return '—'
+  return fmt(Number(v), state.currency)
 }
 // 模块「内容」模板:占位符统一英文(便于兼容其他模型 API 时区分来源/字段):
 //   {expense_ds} 今日已用金额 · {balance_ds} 余额 · {status} 高峰/空闲状态字 · {countdown} 倒计时
@@ -12829,6 +13050,12 @@ function bubbleContentTokenMap(m) {
   if (m.type === 'balance') {
     v = bubbleAmountText()
     map['balance_ds'] = v
+  } else if (m.type === 'bonus') {
+    // v782：赠金模块（{bonus_ds}）。取不到数 = '—'，不显示 0。
+    map['bonus_ds'] = bubbleBonusText()
+  } else if (m.type === 'recharge') {
+    // v782：充值余额模块（{recharge_ds}）。
+    map['recharge_ds'] = bubbleRechargeText()
   } else if (m.type === 'today') {
     v = (state.todayUsage !== null && state.todayUsage !== undefined ? fmt(state.todayUsage, state.todayUsageCurrency || state.currency) : '--')
     map['expense_ds'] = v
@@ -12866,7 +13093,9 @@ function bubbleTplHelpItems(m) {
     add('plan_reset', '订阅额度刷新倒计时（同上；全部窗口时为紧凑倒计时）')
     return arr
   }
-  if (m.type === 'balance') add('balance_ds', '余额数值')
+  if (m.type === 'balance') add('balance_ds', '总余额(充值金额+赠金)')
+  if (m.type === 'bonus') add('bonus_ds', '赠金余额（未过期的赠送余额；取不到显示 —）')
+  if (m.type === 'recharge') add('recharge_ds', '充值余额（不含赠金；取不到显示 —）')
   else if (m.type === 'today') add('expense_ds', '今日已用金额')
   else if (m.type === 'session') add('session', '当前对话名（超过「保留长度」会截断为 前N字...）')
   else if (m.type === 'peak' || m.type === 'nextpeak') {
@@ -12889,7 +13118,7 @@ function bubbleTplHelpToggle(m, anchor) {
         } catch (err) {}
         dshwvTplHelpEl.style.display = 'none'
       }, true)
-      document.addEventListener('keydown', function (e) { if (e.key === 'Escape') dshwvTplHelpEl.style.display = 'none' })
+      document.addEventListener('keydown', function (e) { if (dshwvComposingNow()) return; if (e.key === 'Escape') dshwvTplHelpEl.style.display = 'none' })
     }
     if (dshwvTplHelpEl.style.display === 'block') { dshwvTplHelpEl.style.display = 'none'; return }
     var items = bubbleTplHelpItems(m)
@@ -12933,7 +13162,7 @@ function dshwvHintEnsure() {
     } catch (err) {}
     dshwvHintHide()
   }, true)
-  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') dshwvHintHide() })
+  document.addEventListener('keydown', function (e) { if (dshwvComposingNow()) return; if (e.key === 'Escape') dshwvHintHide() })
   return dshwvHintEl
 }
 function dshwvHintShow(html, anchor, pinned) {
@@ -13264,6 +13493,9 @@ function bubbleRowContentOf(mod) {
     var bv = bubbleIsModelMod(mod) ? apiModelBalanceText(mod.modelId) : bubbleAmountText()
     return { txt: bubbleContentText(mod, bv), line: null }
   }
+  // v782：赠金 / 充值余额两个数值模块（与「总余额(充值金额+赠金)」并列，取不到数时自动文案是 —）
+  if (mod.type === 'bonus') return { txt: bubbleContentText(mod, bubbleBonusText()), line: null }
+  if (mod.type === 'recharge') return { txt: bubbleContentText(mod, bubbleRechargeText()), line: null }
   if (mod.type === 'today') {
     var tv2 = bubbleIsModelMod(mod) ? apiModelTodayText(mod.modelId) : (state.todayUsage !== null && state.todayUsage !== undefined ? fmt(state.todayUsage, state.todayUsageCurrency || state.currency) : '--')
     return { txt: bubbleContentText(mod, '今日已用 ' + tv2), line: null }
@@ -14032,6 +14264,10 @@ function express() {
   root.style.right = 'auto'
   root.style.bottom = 'auto'
   root.style.left = state.left + 'px'
+  // v785：最后一道保险 —— 所有"写 state.top"的路径最终都会走到这里，统一把顶边夹出"窗口控件带"
+  // （拖动/吸附/settle 各自也夹了一次；这里兜住启动、自愈、外部直接改 state 等路径）。
+  // 见 clampWidgetTop：下限 = 叠层下沿（普通浏览器为 0 ⇒ 与以前完全一致）。
+  state.top = clampWidgetTop(state.top)
   root.style.top = state.top + 'px'
   root.classList.toggle('dshwv-left', !!state.flip)
 }
@@ -14042,7 +14278,7 @@ function settle() {
   if (drag && drag.active) {
     // mid-drag resize: keep the pointer-follow position, just clamp into view
     state.left = clamp(state.left, 0, Math.max(0, vp.w - w - rightGap()))
-    state.top = clamp(state.top, 0, Math.max(0, vp.h - h))
+    state.top = clampWidgetTop(state.top, Math.max(0, vp.h - h))
     express()
     return
   }
@@ -14066,22 +14302,22 @@ function settle() {
   }
   if (state.v === 'bottom') {
     var rawB = vp.h - h - state.vOff
-    state.top = clamp(rawB, 0, maxT)
+    state.top = clampWidgetTop(rawB, maxT)
     if (state.top !== rawB) outOfRange = true
   } else if (state.v === 'top') {
     var rawT = state.vOff
-    state.top = clamp(rawT, 0, maxT)
+    state.top = clampWidgetTop(rawT, maxT)
     if (state.top !== rawT) outOfRange = true
   } else {
-    state.top = clamp(state.top, 0, maxT)
+    state.top = clampWidgetTop(state.top, maxT)
   }
   // 偏移确实越界（脏数据 / 视口变小）：先把偏移夹回合法范围再落盘，下次启动不再复现。
   // 只在真的越界时写，正常 resize 不会产生额外的 localStorage 写入。
   if (outOfRange) {
     if (state.h === 'right') state.hOff = clamp(state.hOff, 0, Math.max(0, vp.w - w - rightGap()))
     else if (state.h === 'left') state.hOff = clamp(state.hOff, 0, maxLAnchor)
-    if (state.v === 'bottom') state.vOff = clamp(state.vOff, 0, maxT)
-    else if (state.v === 'top') state.vOff = clamp(state.vOff, 0, maxT)
+    if (state.v === 'bottom') state.vOff = clamp(state.vOff, 0, Math.max(0, maxT - widgetTopMin()))
+    else if (state.v === 'top') state.vOff = clamp(state.vOff, widgetTopMin(), maxT)
     try { saveAnchorPos() } catch (err) {}
   }
   refreshFlip()
@@ -14189,6 +14425,9 @@ function refresh(manual) {
         balanceRetryLeft = 2
         state.todayUsage = data.todayUsage !== undefined ? data.todayUsage : null
         state.todayUsageCurrency = data.todayUsageCurrency || data.currency || 'CNY'
+        // v781：赠金 / 充值余额（宿主两条路都下发；缺失给 null ⇒ 模块显示 —）
+        state.bonusBalance = isFinite(Number(data.bonusBalance)) ? Number(data.bonusBalance) : null
+        state.rechargeBalance = isFinite(Number(data.rechargeBalance)) ? Number(data.rechargeBalance) : null
         state.usageLabel = data.usageLabel || '本地估算'
         if (data.stale) state.usageLabel += ' · 余额未刷新'
         state.isPeak = !!data.isPeak
@@ -14223,6 +14462,9 @@ function refresh(manual) {
       } else {
         state.status = 'error'
         state.message = (data && data.error) ? String(data.error) : '获取失败'
+        // v781：把宿主的错误码也打到控制台 —— "只登录客户端读不到余额"这类反馈里，
+        //   界面只显示一句人类可读的文案，而 code（NO_KEY / BOTH_FAILED / SHAPE …）才是排查入口。
+        try { console.warn('[dsh-whale] 余额读取失败', (data && data.code) || '', state.message) } catch (err) {}
         render()
         balanceRetryLater()
       }
@@ -14478,7 +14720,7 @@ function setScale(v) {
   } else {
     state.left = Math.min(Math.max(fx - r2.width, 0), Math.max(0, vp.w - r2.width))
   }
-  state.top = Math.min(Math.max(fy - r2.height, 0), Math.max(0, vp.h - r2.height))
+  state.top = clampWidgetTop(Math.min(Math.max(fy - r2.height, 0), Math.max(0, vp.h - r2.height)))
   express()
   // 恢复过渡必须延迟到下一帧：本帧 left/top 已在 none 下设置并提交，
   // 立即恢复会让浏览器对「刚改过的 left/top」重新评估并播放过渡动画
@@ -16489,7 +16731,8 @@ function onDocPointerMove(e) {
   // were); on release endDrag() recomputes the anchors and settle() flips the
   // class with a smooth transition instead of reverting instantly.
   state.left = clamp(drag.origLeft + dx, 0, Math.max(0, drag.vp.w - drag.w))
-  state.top = clamp(drag.origTop + dy, 0, Math.max(0, drag.vp.h - drag.h))
+  // v785：拖拽时就把"桌面端窗口控件带"排除在可移动范围外（顶边下限 = 叠层下沿）
+  state.top = clampWidgetTop(drag.origTop + dy, Math.max(0, drag.vp.h - drag.h))
   express()
 }
 function onDocPointerUp(e) {
@@ -16741,7 +16984,8 @@ function endDrag(e, clickAllowed, cancelled) {
   var dx = e.clientX - drag.startX
   var dy = e.clientY - drag.startY
   var left = clamp(drag.origLeft + dx, 0, Math.max(0, drag.vp.w - drag.w))
-  var top = clamp(drag.origTop + dy, 0, Math.max(0, drag.vp.h - drag.h))
+  // v785：落位计算也要先排除"窗口控件带"（否则吸附判定点会用到带内的 top）
+  var top = clampWidgetTop(drag.origTop + dy, Math.max(0, drag.vp.h - drag.h))
   // 自定义吸附区（比例/绝对/关闭）。判定点：左右吸附/翻转 = 图像中心 x，
   // 下吸附 = 图像中心 y，上吸附 = 挂件盒中心 y。
   // 解析计算，避免拖动结束过渡期强制布局。
@@ -16797,7 +17041,8 @@ function applyAnchorPos() {
     var l = a.hAnchor === 'left' ? hDist : vp.w - effectiveRightDist - w
     var t = a.vAnchor === 'top' ? vDist : vp.h - vDist - h
     state.left = clamp(l, 0, maxOffH)
-    state.top = clamp(t, 0, maxOffV)
+    // v785：锚点自愈/恢复也要排除"窗口控件带"（这条路径不一定紧跟 express，所以就地夹）
+    state.top = clampWidgetTop(clamp(t, 0, maxOffV), maxOffV)
     state.h = a.hAnchor
     // 净距离直接还给 hOff/vOff：settle() 对锚定状态从偏移量重算，
     // 若置 0 会把刚恢复的距离覆盖成贴边（issue #43）
